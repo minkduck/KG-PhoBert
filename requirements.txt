@@ -1,9 +1,8 @@
-streamlit
-torch
-transformers
-rdflib
-pyvi
-numpy
-pandas
-openpyxl
-gdown
+streamlit==1.31.0
+torch==2.1.0
+transformers==4.38.2
+rdflib==7.0.0
+pyvi==0.1.1
+numpy==1.26.4
+pandas==2.1.4
+openpyxl==3.1.2
