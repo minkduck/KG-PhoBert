@@ -119,7 +119,15 @@ def get_model(domain: str, model_type: str,
                 model = ckpt
             else:
                 sd = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
-                model.load_state_dict(sd, strict=False)
+                # Filter out keys not present in this architecture
+                # (e.g. 'pooler.*' from checkpoints saved with add_pooling_layer=True)
+                own_keys  = set(model.state_dict().keys())
+                filtered  = {k: v for k, v in sd.items() if k in own_keys}
+                dropped   = set(sd.keys()) - own_keys
+                if dropped:
+                    print(f"\u2139\ufe0f  Ignored {len(dropped)} unexpected key(s) "
+                          f"(e.g. {sorted(dropped)[:3]})")    # e.g. pooler.*
+                model.load_state_dict(filtered, strict=True)
             print(f"\u2705 Loaded {filename}")
         except Exception as exc:
             st.warning(f"\u26a0\ufe0f Could not load {rel_path}: {exc}")
@@ -483,8 +491,11 @@ class PhoBERT_Fusion_V2(nn.Module):
         super().__init__()
         self.fusion_type = fusion_type
 
-        # Backbone
-        self.phobert = AutoModel.from_pretrained("vinai/phobert-base-v2")
+        # Backbone — add_pooling_layer=False avoids pooler.* keys that are
+        # absent in checkpoints saved directly from RobertaModel without pooler.
+        self.phobert = AutoModel.from_pretrained(
+            "vinai/phobert-base-v2", add_pooling_layer=False
+        )
         self.dropout  = nn.Dropout(p=0.3)
 
         # Ontology adapter
@@ -509,13 +520,14 @@ class PhoBERT_Fusion_V2(nn.Module):
         self.fc = nn.Linear(inp_dim, n_classes)
 
     def forward(self, input_ids, attention_mask, ontology_features=None):
-        # 1. PhoBERT pooled [CLS] embedding
-        _, text_emb = self.phobert(
+        # 1. Raw [CLS] token from sequence output (no pooler transformation)
+        #    seq_out shape: (batch, seq_len, 768)
+        seq_out  = self.phobert(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=False,
-        )
-        text_emb = self.dropout(text_emb)
+        )[0]
+        text_emb = self.dropout(seq_out[:, 0, :])   # (batch, 768)
 
         # 2. Fusion logic
         if self.fusion_type == "none":
@@ -969,8 +981,8 @@ def main():
             else:
                 items2 = []
                 for d in ["VSFC", "VSMEC", "VSFC-Ekman"]:
-                    with st.spinner(f"Comparing models on domain '{d}' (loading sequentially)…"):
-                        # ── Step 1: Baseline weights → run Baseline + Baseline+Rule ──
+                    # ── Step 1: Load Baseline, run Baseline + Baseline+Rule ──────────
+                    with st.spinner(f"[{d}] Processing with Baseline… (evicts previous model)"):
                         model_b  = get_model(d, "Baseline", _dim)
                         res_base = predict_with_model(
                             text_input2, d, "Baseline",      model_b, tokenizer, ontology_engine
@@ -978,14 +990,18 @@ def main():
                         res_rule = predict_with_model(
                             text_input2, d, "Baseline+Rule", model_b, tokenizer, ontology_engine
                         )
+                        del model_b                # drop local reference
 
-                        # ── Step 2: Evict Baseline, load RawGate ─────────────────────
-                        _evict_model()
+                    # ── Step 2: Evict Baseline from slot, load RawGate ───────────────
+                    _evict_model()
+                    with st.spinner(f"[{d}] Processing with RawGate… (evicts Baseline)"):
                         model_g  = get_model(d, "RawGate", _dim)
                         res_gate = predict_with_model(
                             text_input2, d, "RawGate", model_g, tokenizer, ontology_engine
                         )
-                        _evict_model()   # free before next domain iteration
+                        del model_g                # drop local reference
+
+                    _evict_model()                 # free RawGate before next domain
 
                     items2.append({
                         "domain":   d,
