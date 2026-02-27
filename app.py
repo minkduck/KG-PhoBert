@@ -119,15 +119,7 @@ def get_model(domain: str, model_type: str,
                 model = ckpt
             else:
                 sd = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
-                # Filter out keys not present in this architecture
-                # (e.g. 'pooler.*' from checkpoints saved with add_pooling_layer=True)
-                own_keys  = set(model.state_dict().keys())
-                filtered  = {k: v for k, v in sd.items() if k in own_keys}
-                dropped   = set(sd.keys()) - own_keys
-                if dropped:
-                    print(f"\u2139\ufe0f  Ignored {len(dropped)} unexpected key(s) "
-                          f"(e.g. {sorted(dropped)[:3]})")    # e.g. pooler.*
-                model.load_state_dict(filtered, strict=True)
+                model.load_state_dict(sd, strict=False)
             print(f"\u2705 Loaded {filename}")
         except Exception as exc:
             st.warning(f"\u26a0\ufe0f Could not load {rel_path}: {exc}")
@@ -491,11 +483,8 @@ class PhoBERT_Fusion_V2(nn.Module):
         super().__init__()
         self.fusion_type = fusion_type
 
-        # Backbone — add_pooling_layer=False avoids pooler.* keys that are
-        # absent in checkpoints saved directly from RobertaModel without pooler.
-        self.phobert = AutoModel.from_pretrained(
-            "vinai/phobert-base-v2", add_pooling_layer=False
-        )
+        # Backbone — standard RoBERTa/PhoBERT with pooler layer
+        self.phobert = AutoModel.from_pretrained("vinai/phobert-base-v2")
         self.dropout  = nn.Dropout(p=0.3)
 
         # Ontology adapter
@@ -520,14 +509,13 @@ class PhoBERT_Fusion_V2(nn.Module):
         self.fc = nn.Linear(inp_dim, n_classes)
 
     def forward(self, input_ids, attention_mask, ontology_features=None):
-        # 1. Raw [CLS] token from sequence output (no pooler transformation)
-        #    seq_out shape: (batch, seq_len, 768)
-        seq_out  = self.phobert(
+        # 1. PhoBERT pooled [CLS] embedding (matches training-time architecture)
+        _, text_emb = self.phobert(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=False,
-        )[0]
-        text_emb = self.dropout(seq_out[:, 0, :])   # (batch, 768)
+        )
+        text_emb = self.dropout(text_emb)
 
         # 2. Fusion logic
         if self.fusion_type == "none":
