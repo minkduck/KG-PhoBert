@@ -1,4 +1,5 @@
 import os
+import gc
 # Must be set BEFORE importing transformers to prevent the
 # tensorflow → keras → cv2 → numpy-2.x crash that hides AutoTokenizer.
 os.environ.setdefault("USE_TF", "0")
@@ -52,6 +53,81 @@ DOMAIN_CLASSES = {
     "VSMEC":      ["Anger", "Disgust", "Enjoyment", "Fear", "Other", "Sadness", "Surprise"],
     "VSFC-Ekman": ["Anger", "Disgust", "Fear", "Joy", "Neutral", "Sadness", "Surprise"],
 }
+
+# (domain, base_model_type) → (filename, fusion_type)
+FILE_MAPPING = {
+    ("VSFC",       "Baseline"): ("phobert_baseline_m1.pth",    "none"),
+    ("VSFC",       "RawGate"):  ("phobert_gate_m3.pth",         "gate"),
+    ("VSMEC",      "Baseline"): ("vsmec_baseline_m1.pth",       "none"),
+    ("VSMEC",      "RawGate"):  ("vsmec_gate_m3.pth",           "gate"),
+    ("VSFC-Ekman", "Baseline"): ("vsfc_ekman_baseline_m1.pth",  "none"),
+    ("VSFC-Ekman", "RawGate"):  ("vsfc_ekman_raw_gate_m3.pth",  "gate"),
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Module-level single-model slot — only ONE PhoBERT model in RAM at a time.
+# Streamlit keeps module globals alive across reruns (same process lifetime).
+# ──────────────────────────────────────────────────────────────────────────────
+_model_slot: dict = {"key": None, "model": None}
+
+
+def _evict_model() -> None:
+    """Delete the currently cached model and free RAM immediately."""
+    if _model_slot["model"] is not None:
+        del _model_slot["model"]
+        _model_slot["model"] = None
+        _model_slot["key"]   = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def get_model(domain: str, model_type: str,
+              ont_input_dim: int = 24) -> "nn.Module":
+    """
+    Return the requested model, loading it on demand and evicting the
+    previously cached model first.  Baseline+Rule reuses Baseline weights.
+
+    Only ONE model is in RAM at any point — safe within Streamlit Cloud’s
+    1 GB limit.
+    """
+    base_type = "Baseline" if model_type == "Baseline+Rule" else model_type
+    key = (domain, base_type, ont_input_dim)
+
+    if _model_slot["key"] == key:          # cache hit — free
+        return _model_slot["model"]
+
+    _evict_model()                         # evict previous model
+
+    filename, fusion = FILE_MAPPING[(domain, base_type)]
+    rel_path = os.path.join("model", filename)
+
+    # Download weight file if not already on disk
+    ensure_file_exists(rel_path)
+
+    num_labels = len(DOMAIN_CLASSES[domain])
+    model = PhoBERT_Fusion_V2(
+        n_classes=num_labels,
+        fusion_type=fusion,
+        ontology_dim=None,
+        ont_input_dim=ont_input_dim,
+    )
+
+    if os.path.exists(rel_path):
+        try:
+            ckpt = torch.load(rel_path, map_location="cpu", weights_only=False)
+            if isinstance(ckpt, nn.Module):
+                model = ckpt
+            else:
+                sd = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
+                model.load_state_dict(sd, strict=False)
+            print(f"\u2705 Loaded {filename}")
+        except Exception as exc:
+            st.warning(f"\u26a0\ufe0f Could not load {rel_path}: {exc}")
+
+    model.eval()
+    _model_slot["key"]   = key
+    _model_slot["model"] = model
+    return model
 
 # ==========================================
 # 2. OntologyEngine  (shared core)
@@ -480,57 +556,8 @@ def load_ontology_engine():
     return OntologyEngine(rdfpath, verbose=True)
 
 
-@st.cache_resource
-def load_models(_ont_input_dim: int = _ONT_INPUT_DIM_DEFAULT):
-    """
-    Load all six .pth weights into PhoBERT_Fusion_V2 instances.
-    Baseline  → fusion_type='none'
-    RawGate   → fusion_type='gate', ontology_dim=None  (raw 24-d KG vector)
-    """
-    models = {}
-    model_dir = "model"
-
-    file_mapping = {
-        ("VSFC",       "Baseline"): ("phobert_baseline_m1.pth",    "none"),
-        ("VSFC",       "RawGate"):  ("phobert_gate_m3.pth",         "gate"),
-        ("VSMEC",      "Baseline"): ("vsmec_baseline_m1.pth",       "none"),
-        ("VSMEC",      "RawGate"):  ("vsmec_gate_m3.pth",           "gate"),
-        ("VSFC-Ekman", "Baseline"): ("vsfc_ekman_baseline_m1.pth",  "none"),
-        ("VSFC-Ekman", "RawGate"):  ("vsfc_ekman_raw_gate_m3.pth",  "gate"),
-    }
-
-    for (domain, mtype), (filename, fusion) in file_mapping.items():
-        rel_path    = os.path.join(model_dir, filename)
-        # Download from Hugging Face if the weight file is missing locally
-        ensure_file_exists(rel_path)
-
-        num_labels  = len(DOMAIN_CLASSES[domain])
-        model       = PhoBERT_Fusion_V2(
-            n_classes=num_labels,
-            fusion_type=fusion,
-            ontology_dim=None,          # Raw mode (xAI-compatible)
-            ont_input_dim=_ont_input_dim,
-        )
-
-        if os.path.exists(rel_path):
-            try:
-                ckpt = torch.load(rel_path, map_location="cpu", weights_only=False)
-                if isinstance(ckpt, nn.Module):
-                    model = ckpt
-                else:
-                    sd = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
-                    model.load_state_dict(sd, strict=False)
-                print(f"✅ Loaded {filename}")
-            except Exception as e:
-                print(f"⚠️ Could not load {rel_path}: {e}")
-
-        model.eval()
-        models[(domain, mtype)] = model
-        if mtype == "Baseline":
-            # Baseline+Rule shares weights; rules applied at inference time
-            models[(domain, "Baseline+Rule")] = model
-
-    return models
+# load_models() removed — replaced by the lazy get_model() above.
+# Models are now loaded on demand, one at a time, to stay within 1 GB RAM.
 
 
 # ==========================================
@@ -632,10 +659,10 @@ def apply_rules(initial_label: str, probs: dict, kg_vector: np.ndarray,
 # ==========================================
 # 6. Inference Function
 # ==========================================
-def predict_with_model(text, domain, model_type, tokenizer, models, ontology_engine):
-    classes     = DOMAIN_CLASSES.get(domain, [])
-    fetch_type  = "Baseline" if model_type == "Baseline+Rule" else model_type
-    model       = models.get((domain, fetch_type))
+def predict_with_model(text, domain, model_type, model, tokenizer, ontology_engine):
+    """Run inference using the pre-loaded *model* (caller's responsibility to
+    obtain the correct model via get_model() before calling this function)."""
+    classes = DOMAIN_CLASSES.get(domain, [])
 
     # --- KG vector + hit_trace via OntologyEngine ---
     kg_vector = np.zeros(_ONT_INPUT_DIM_DEFAULT, dtype=np.float32)
@@ -812,8 +839,9 @@ def main():
 
     st.title("Hybrid Ontology-NLP Emotion Classifier (Demo)")
 
-    # ── Load resources once (cached) ─────────────────────────────────────────
-    with st.spinner("Initializing system and loading resources…"):
+    # ── Load lightweight resources once (cached) ─────────────────────────────
+    # PhoBERT model weights are loaded lazily via get_model() at inference time.
+    with st.spinner("Initializing tokenizer and ontology engine…"):
         tokenizer       = load_tokenizer()
         ontology_engine = load_ontology_engine()
         if ontology_engine is not None:
@@ -823,7 +851,6 @@ def main():
                 _dim = _ONT_INPUT_DIM_DEFAULT
         else:
             _dim = _ONT_INPUT_DIM_DEFAULT
-        models = load_models(_dim)
 
     # ── Session-state — initialise once per browser session ──────────────────
     if "results_tab1" not in st.session_state:
@@ -844,7 +871,6 @@ def main():
         st.header("Single Model Inference")
         st.caption(f"Domain: **{domain_label}**")
 
-        # st.form prevents reruns while the user edits widgets.
         with st.form("form_tab1"):
             text_input = st.text_area(
                 "Enter Vietnamese sentence:",
@@ -858,7 +884,7 @@ def main():
             )
             submitted1 = st.form_submit_button("Predict")
 
-        # Run inference on submit
+        # Run inference on submit — loads exactly ONE model on demand
         if submitted1:
             if not text_input.strip():
                 st.warning("Please enter some text.")
@@ -869,10 +895,14 @@ def main():
                 )
                 items = []
                 for d in domains_to_run:
-                    with st.spinner(f"Running inference on domain '{d}'…"):
-                        result = predict_with_model(
-                            text_input, d, model_type, tokenizer, models, ontology_engine
-                        )
+                    with st.spinner(
+                        f"Loading {model_type} model for '{d}'… "
+                        f"(stays cached until you switch model)"
+                    ):
+                        model = get_model(d, model_type, _dim)
+                    result = predict_with_model(
+                        text_input, d, model_type, model, tokenizer, ontology_engine
+                    )
                     items.append({
                         "domain":     d,
                         "model_type": model_type,
@@ -931,7 +961,7 @@ def main():
             )
             submitted2 = st.form_submit_button("Compare")
 
-        # Run comparison on submit — always compares all three domains
+        # Run comparison on submit — loads ONE model at a time, processes, evicts
         if submitted2:
             if not text_input2.strip():
                 st.warning("Please enter some text.")
@@ -939,16 +969,24 @@ def main():
             else:
                 items2 = []
                 for d in ["VSFC", "VSMEC", "VSFC-Ekman"]:
-                    with st.spinner(f"Evaluating all models on domain '{d}'…"):
+                    with st.spinner(f"Comparing models on domain '{d}' (loading sequentially)…"):
+                        # ── Step 1: Baseline weights → run Baseline + Baseline+Rule ──
+                        model_b  = get_model(d, "Baseline", _dim)
                         res_base = predict_with_model(
-                            text_input2, d, "Baseline",      tokenizer, models, ontology_engine
-                        )
-                        res_gate = predict_with_model(
-                            text_input2, d, "RawGate",       tokenizer, models, ontology_engine
+                            text_input2, d, "Baseline",      model_b, tokenizer, ontology_engine
                         )
                         res_rule = predict_with_model(
-                            text_input2, d, "Baseline+Rule", tokenizer, models, ontology_engine
+                            text_input2, d, "Baseline+Rule", model_b, tokenizer, ontology_engine
                         )
+
+                        # ── Step 2: Evict Baseline, load RawGate ─────────────────────
+                        _evict_model()
+                        model_g  = get_model(d, "RawGate", _dim)
+                        res_gate = predict_with_model(
+                            text_input2, d, "RawGate", model_g, tokenizer, ontology_engine
+                        )
+                        _evict_model()   # free before next domain iteration
+
                     items2.append({
                         "domain":   d,
                         "multi":    True,
