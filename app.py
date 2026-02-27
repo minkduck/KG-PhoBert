@@ -696,8 +696,8 @@ def predict_with_model(text, domain, model_type, model, tokenizer, ontology_engi
             "rule_name":     None,
         }
 
-    # --- PhoBERT tokenisation ---
-    encoded = tokenizer.encode_plus(
+    # --- PhoBERT tokenisation (use __call__ — encode_plus is deprecated) ---
+    encoded = tokenizer(
         text,
         add_special_tokens=True,
         return_tensors="pt",
