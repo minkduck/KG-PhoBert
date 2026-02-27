@@ -1,0 +1,9 @@
+streamlit
+torch
+transformers
+rdflib
+pyvi
+numpy
+pandas
+openpyxl
+gdown

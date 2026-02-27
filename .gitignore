@@ -1,0 +1,25 @@
+# Model weights and knowledge graph (hosted on Hugging Face)
+model/
+ekman6_4_9.rdf
+ekman6_4_8.rdf
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
