@@ -216,11 +216,14 @@ class OntologyEngine:
 
         self.sim_matrix = self._build_similarity_matrix()
         self.lexiconmap = self._build_strict_lexicon()
-        self._inject_extra_negation_cues()      # Fix A: runtime ABox extension
 
+        # mwe_max_len must be initialised BEFORE _inject_extra_negation_cues()
+        # because the injection method updates it for MWE cues.
         self.mwe_max_len = 1
         for k in self.lexiconmap:
             self.mwe_max_len = max(self.mwe_max_len, len(k.split()))
+
+        self._inject_extra_negation_cues()      # Fix A: runtime ABox extension
 
         if verbose:
             print(f"   📚 Lexicon: {len(self.lexiconmap)} entries, max MWE length: {self.mwe_max_len}")
