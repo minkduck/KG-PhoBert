@@ -318,11 +318,13 @@ class OntologyEngine:
                 continue
 
             apps, ints, pols = self._infer_attributes(r.stim, emos.keys())
-            entry_score = float(r.ev or self.defaultconf) * float(r.base or 1.0)
+            conf_score  = float(r.ev or self.defaultconf)
+            entry_score = conf_score * float(r.base or 1.0)
 
             entry = {
                 "emotions":    emos,
                 "score":       entry_score,
+                "confidence":  conf_score,          # raw confidenceScore for display
                 "appraisals":  list(apps),
                 "intensities": list(ints),
                 "polarities":  list(pols),
@@ -406,11 +408,12 @@ class OntologyEngine:
             if debug:
                 ent0 = match[0]
                 hit_trace.append({
-                    "phrase":     phrase_str,
-                    "emotions":   ent0["emotions"],
-                    "polarities": ent0["polarities"],
-                    "appraisals": ent0["appraisals"],
-                    "score":      round(ent0["score"], 4),
+                    "phrase":      phrase_str,
+                    "emotions":    ent0["emotions"],
+                    "polarities":  ent0["polarities"],
+                    "appraisals":  ent0["appraisals"],
+                    "score":       round(ent0["score"], 4),
+                    "confidence":  round(ent0.get("confidence", ent0["score"]), 4),
                 })
 
             for ent in match:
@@ -779,7 +782,7 @@ def render_xai(result, model_type):
             "Matched Phrase": h["phrase"],
             "Emotions":       emo_str,
             "Polarity":       dominant_pol,
-            "Confidence":     f"{h['score']:.3f}",
+            "Confidence":     f"{h.get('confidence', h['score']):.3f}",
         })
 
     st.table(pd.DataFrame(rows))
