@@ -363,7 +363,7 @@ class OntologyEngine:
 
         return a, i, p
 
-    # ---- main inference entry point ----------------------------------------
+    # ---- main inference entry point (2-pass scan) ---------------------------
     def getvector(self, text, debug=False):
         """
         Returns (vector, tokens, hit_trace) when debug=True, else just vector.
@@ -375,61 +375,97 @@ class OntologyEngine:
             [19:22] polarity scores (POLARITY_CLASSES order)  ← idx 19=Pos, 20=Neg, 21=Neu
             [22:24] negation flag + reserved
 
-        hit_trace entries:
-            {"phrase": str, "emotions": dict[str,float], "polarities": list[str],
-             "appraisals": list[str], "score": float}
+        2-pass design:
+          PASS 1 — Scan for NegationCue spans only (independent channel).
+          PASS 2 — Scan for emotion/appraisal entries (independent channel).
+                    Every token is visited; negation tag added if token falls
+                    inside a negation scope, but the entry is NEVER silently skipped.
         """
         raw_tokens = ViTokenizer.tokenize(str(text).lower()).split()
         flat = [self._norm(t) for t in raw_tokens if self._norm(t)]
+        n = len(flat)
 
-        ve = np.zeros(len(self.ALLEMOTIONS),    dtype=np.float32)
-        va = np.zeros(len(self.ALLAPPRAISALS),  dtype=np.float32)
+        ve = np.zeros(len(self.ALLEMOTIONS),       dtype=np.float32)
+        va = np.zeros(len(self.ALLAPPRAISALS),     dtype=np.float32)
         vi = np.zeros(len(self.INTENSITY_CLASSES), dtype=np.float32)
         vp = np.zeros(len(self.POLARITY_CLASSES),  dtype=np.float32)
         vn = np.zeros(2, dtype=np.float32)
 
-        idx, n = 0, len(flat)
         hit_trace = []
 
-        while idx < n:
-            match, match_len = None, 0
-            for L in range(min(self.mwe_max_len, n - idx), 0, -1):
-                phrase = " ".join(flat[idx: idx + L])
+        def _find_match(start):
+            """Longest-match-first lookup. Returns (entries, length, phrase) or (None,0,None)."""
+            for L in range(min(self.mwe_max_len, n - start), 0, -1):
+                phrase = " ".join(flat[start: start + L])
                 if phrase in self.lexiconmap:
-                    match, match_len = self.lexiconmap[phrase], L
-                    break
+                    return self.lexiconmap[phrase], L, phrase
+            return None, 0, None
 
-            if match is None:
-                idx += 1
+        # ── PASS 1: collect all NegationCue spans ───────────────────────────────
+        negation_spans = []   # [{start, end, scope_end, phrase, attn, ent}]
+        i = 0
+        while i < n:
+            entries, length, phrase = _find_match(i)
+            if entries is not None:
+                neg_ent = next((e for e in entries if e["isnegation"]), None)
+                if neg_ent is not None:
+                    scope = neg_ent.get("negation_scope", 2)
+                    attn  = neg_ent.get("negation_attn",  self.negation_attenuation)
+                    negation_spans.append({
+                        "start":     i,
+                        "end":       i + length,       # first token NOT part of cue
+                        "scope_end": i + length + scope,
+                        "phrase":    phrase,
+                        "attn":      attn,
+                        "ent":       neg_ent,
+                    })
+                    vn[0] = 1.0
+                    if debug:
+                        hit_trace.append({
+                            "phrase":     phrase,
+                            "emotions":   neg_ent["emotions"],
+                            "polarities": neg_ent["polarities"],
+                            "appraisals": neg_ent["appraisals"],
+                            "score":      round(neg_ent.get("confidence", neg_ent["score"]), 4),
+                            "confidence": round(neg_ent.get("confidence", neg_ent["score"]), 4),
+                        })
+                    i += length
+                    continue
+            i += 1  # advance by 1 so no NegationCue is ever skipped
+
+        # ── PASS 2: scan ALL tokens for emotion / appraisal entries ───────────────
+        # Every position is visited independently of negation spans.
+        # NegationCue-only matches are skipped (already registered in Pass 1).
+        i = 0
+        while i < n:
+            entries, length, phrase_str = _find_match(i)
+            if entries is None:
+                i += 1
                 continue
 
-            phrase_str = " ".join(flat[idx: idx + match_len])
+            # Filter out NegationCue entries — handled in Pass 1
+            emo_entries = [e for e in entries if not e["isnegation"]]
+            if not emo_entries:
+                i += length
+                continue
 
-            if debug:
-                ent0 = match[0]
-                hit_trace.append({
-                    "phrase":      phrase_str,
-                    "emotions":    ent0["emotions"],
-                    "polarities":  ent0["polarities"],
-                    "appraisals":  ent0["appraisals"],
-                    "score":       round(ent0["score"], 4),
-                    "confidence":  round(ent0.get("confidence", ent0["score"]), 4),
-                })
+            # Is this position inside any negation scope?
+            covering_neg = next(
+                (neg for neg in negation_spans
+                 if neg["end"] <= i < neg["scope_end"]),
+                None,
+            )
+            is_negated  = covering_neg is not None
+            attn_factor = covering_neg["attn"] if is_negated else 1.0
 
-            for ent in match:
-                if ent["isnegation"]:
-                    vn[0] = 1.0
-                    continue
-
-                sc = ent["score"]
-                if vn[0] > 0:
-                    sc *= self.negation_attenuation
+            for ent in emo_entries:
+                sc = ent["score"] * attn_factor
 
                 for e, w in ent["emotions"].items():
                     if e in self.ALLEMOTIONS:
                         ve[self.ALLEMOTIONS.index(e)] += sc * w
 
-                # VSFC polarity injection: aggregate emotion scores into polarity dims
+                # VSFC polarity injection
                 pos_sc = sum(w for e, w in ent["emotions"].items() if e in self.POS_EMOTIONS)
                 neg_sc = sum(w for e, w in ent["emotions"].items() if e in self.NEG_EMOTIONS)
                 neu_sc = ent["emotions"].get("Neutral", 0.0)
@@ -439,7 +475,6 @@ class OntologyEngine:
                 for x in ent["polarities"]:
                     if x in self.POLARITY_CLASSES:
                         vp[self.POLARITY_CLASSES.index(x)] += sc
-
                 for x in ent["appraisals"]:
                     if x in self.ALLAPPRAISALS:
                         va[self.ALLAPPRAISALS.index(x)] += sc
@@ -447,7 +482,22 @@ class OntologyEngine:
                     if x in self.INTENSITY_CLASSES:
                         vi[self.INTENSITY_CLASSES.index(x)] = 1.0
 
-            idx += match_len
+            if debug:
+                ent0 = emo_entries[0]
+                trace_entry = {
+                    "phrase":     phrase_str,
+                    "emotions":   ent0["emotions"],
+                    "polarities": ent0["polarities"],
+                    "appraisals": ent0["appraisals"],
+                    "score":      round(ent0["score"] * attn_factor, 4),
+                    "confidence": round(ent0.get("confidence", ent0["score"]), 4),
+                }
+                if is_negated:
+                    trace_entry["negated_by"] = covering_neg["phrase"]
+                    trace_entry["attn_factor"] = attn_factor
+                hit_trace.append(trace_entry)
+
+            i += length
 
         if self.alpha_similarity > 0:
             ve = np.clip(ve + self.alpha_similarity * (ve @ self.sim_matrix), 0, None)
@@ -809,26 +859,12 @@ def main():
     with st.sidebar:
         st.header("Settings")
 
-        DOMAIN_DISPLAY = {
-            "Education (VSFC)":            "VSFC",
-            "Social (VSMEC)":              "VSMEC",
-            "Education – 7 label (Ekman)": "VSFC-Ekman",
-            "All domains":                 "All",
-        }
-
-        domain_label = st.selectbox(
-            "Domain",
-            list(DOMAIN_DISPLAY.keys()),
-            key="sidebar_domain",
-            help="Applied to both Single-model and Compare tabs.",
-        )
-        domain = DOMAIN_DISPLAY[domain_label]
+        # Domain is fixed to All — all three datasets always run.
+        domain = "All"
 
         st.divider()
 
         # Tab selector — stored in session_state so it survives reruns.
-        # This is the ONLY reliable way to prevent Streamlit from jumping
-        # back to tab 0 after a form submission triggers a rerun.
         active_tab = st.radio(
             "View",
             ["Single model", "Compare models"],
@@ -839,10 +875,9 @@ def main():
         st.divider()
         st.caption("Hybrid Ontology-NLP Emotion Classifier")
 
-    st.title("Hybrid Ontology-NLP Emotion Classifier (Demo)")
+    st.title("Hybrid Ontology-NLP Emotion Classifier")
 
     # ── Load lightweight resources once (cached) ─────────────────────────────
-    # PhoBERT model weights are loaded lazily via get_model() at inference time.
     with st.spinner("Initializing tokenizer and ontology engine…"):
         tokenizer       = load_tokenizer()
         ontology_engine = load_ontology_engine()
@@ -860,18 +895,11 @@ def main():
     if "results_tab2" not in st.session_state:
         st.session_state.results_tab2 = None
 
-    # ── Clear stale results when the domain changes ───────────────────────────
-    if st.session_state.get("_last_domain") != domain:
-        st.session_state.results_tab1 = None
-        st.session_state.results_tab2 = None
-        st.session_state["_last_domain"] = domain
-
     # =========================================================================
     # VIEW: Single model
     # =========================================================================
     if active_tab == "Single model":
         st.header("Single Model Inference")
-        st.caption(f"Domain: **{domain_label}**")
 
         with st.form("form_tab1"):
             text_input = st.text_area(
