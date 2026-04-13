@@ -419,7 +419,6 @@ class OntologyEngine:
             for ent in match:
                 if ent["isnegation"]:
                     vn[0] = 1.0
-                    idx += match_len
                     continue
 
                 sc = ent["score"]
