@@ -446,7 +446,7 @@ class OntologyEngine:
             # Filter out NegationCue entries — handled in Pass 1
             emo_entries = [e for e in entries if not e["isnegation"]]
             if not emo_entries:
-                i += length
+                i += 1   # advance 1 token only — don't skip over subsequent emotion candidates
                 continue
 
             # Is this position inside any negation scope?
