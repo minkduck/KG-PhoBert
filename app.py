@@ -181,6 +181,20 @@ class OntologyEngine:
     POS_EMOTIONS = {"Happiness", "Enjoyment", "Surprise"}
     NEG_EMOTIONS = {"Anger", "Disgust", "Fear", "Sadness"}
 
+    # ── Runtime ABox extension — negation cues missing from the RDF ──────────
+    # Each entry: surface form → {scope, attenuation, polarityFlip}
+    # Inserted AFTER _build_strict_lexicon() so RDF entries are never clobbered.
+    _EXTRA_NEGATION_CUES = {
+        # "chưa": softer attenuation — implies goal not yet reached, not outright negation
+        "chưa":       {"scope": 2, "attenuation": 0.4, "polarityFlip": True},
+        # "chẳng": equivalent strength to "không"
+        "chẳng":      {"scope": 2, "attenuation": 0.5, "polarityFlip": True},
+        # MWE: "chưa hề" — emphatic temporal negation (scope=3, stronger attn)
+        "chưa hề":    {"scope": 3, "attenuation": 0.6, "polarityFlip": True},
+        # MWE: "không hề" — emphatic absolute negation
+        "không hề":   {"scope": 3, "attenuation": 0.7, "polarityFlip": True},
+    }
+
     def __init__(self, rdfpath,
                  defaultconf=0.9,
                  negation_attenuation=0.4,
@@ -202,6 +216,7 @@ class OntologyEngine:
 
         self.sim_matrix = self._build_similarity_matrix()
         self.lexiconmap = self._build_strict_lexicon()
+        self._inject_extra_negation_cues()      # Fix A: runtime ABox extension
 
         self.mwe_max_len = 1
         for k in self.lexiconmap:
@@ -209,6 +224,7 @@ class OntologyEngine:
 
         if verbose:
             print(f"   📚 Lexicon: {len(self.lexiconmap)} entries, max MWE length: {self.mwe_max_len}")
+            print(f"   🔧 Extra negation cues injected: {list(self._EXTRA_NEGATION_CUES.keys())}")
 
     # ---- helpers -----------------------------------------------------------
     def _norm(self, s):
@@ -333,6 +349,40 @@ class OntologyEngine:
 
         return lookup
 
+    # ---- runtime ABox extension for missing negation cues (Fix A) -----------
+    def _inject_extra_negation_cues(self):
+        """
+        Insert negation-cue lexicon entries for surface forms not covered by the
+        RDF ABox.  Each injected entry carries per-cue scope and attenuation so
+        the scope-aware scan (Fix B) can read them back correctly.
+
+        Longest-match-first is preserved: MWE cues (e.g. "không hề") must be
+        tried before their single-token prefixes (e.g. "không").
+        """
+        for surface, cfg in self._EXTRA_NEGATION_CUES.items():
+            norm_surface = self._norm(surface)
+            # Do NOT overwrite an existing RDF-sourced entry — RDF is authoritative.
+            if norm_surface in self.lexiconmap:
+                if self.verbose:
+                    print(f"   ↳ '{norm_surface}' already in lexicon (RDF wins), skipping injection.")
+                continue
+            self.lexiconmap[norm_surface] = [{
+                "emotions":        {"NegationCue": 1.0},
+                "score":           1.0,
+                "appraisals":      [],
+                "intensities":     [],
+                "polarities":      ["NegativePolarity"],
+                "isnegation":      True,
+                # Per-cue negation parameters (read by Fix-B sub-scan)
+                "negation_scope":  cfg["scope"],
+                "negation_attn":   cfg["attenuation"],
+                "polarityFlip":    cfg["polarityFlip"],
+            }]
+            # Ensure mwe_max_len is updated for multi-token cues
+            tok_count = len(norm_surface.split())
+            if tok_count > self.mwe_max_len:
+                self.mwe_max_len = tok_count
+
     # ---- attribute inference -----------------------------------------------
     def _infer_attributes(self, s, emos):
         EK = self.EKMAN
@@ -389,61 +439,136 @@ class OntologyEngine:
         idx, n = 0, len(flat)
         hit_trace = []
 
-        while idx < n:
-            match, match_len = None, 0
-            for L in range(min(self.mwe_max_len, n - idx), 0, -1):
-                phrase = " ".join(flat[idx: idx + L])
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _accumulate(ent, sc, negated_by=None, attn_factor=None):
+            """Add one lexicon entry's contribution to the running vectors and
+            append a hit_trace record when debug=True."""
+            if not debug and negated_by is None and attn_factor is None:
+                pass  # still accumulate even in non-debug mode
+
+            for e, w in ent["emotions"].items():
+                if e in self.ALLEMOTIONS:
+                    ve[self.ALLEMOTIONS.index(e)] += sc * w
+
+            pos_sc = sum(w for e, w in ent["emotions"].items() if e in self.POS_EMOTIONS)
+            neg_sc = sum(w for e, w in ent["emotions"].items() if e in self.NEG_EMOTIONS)
+            neu_sc = ent["emotions"].get("Neutral", 0.0)
+            if pos_sc > 0: vp[0] += sc * pos_sc
+            if neg_sc > 0: vp[1] += sc * neg_sc
+            if neu_sc > 0: vp[2] += sc * neu_sc
+            for x in ent["polarities"]:
+                if x in self.POLARITY_CLASSES:
+                    vp[self.POLARITY_CLASSES.index(x)] += sc
+            for x in ent["appraisals"]:
+                if x in self.ALLAPPRAISALS:
+                    va[self.ALLAPPRAISALS.index(x)] += sc
+            for x in ent["intensities"]:
+                if x in self.INTENSITY_CLASSES:
+                    vi[self.INTENSITY_CLASSES.index(x)] = 1.0
+
+            if debug:
+                trace_entry = {
+                    "phrase":     phrase_str,
+                    "emotions":   ent["emotions"],
+                    "polarities": ent["polarities"],
+                    "appraisals": ent["appraisals"],
+                    "score":      round(sc, 4),
+                }
+                if negated_by is not None:
+                    trace_entry["negated_by"]   = negated_by
+                    trace_entry["attn_factor"]  = attn_factor
+                    trace_entry["is_negated"]   = True
+                hit_trace.append(trace_entry)
+
+        def _find_match(tokens, start):
+            """Longest-match-first lookup starting at *start*.
+            Returns (match_list, match_len) or (None, 0)."""
+            for L in range(min(self.mwe_max_len, n - start), 0, -1):
+                phrase = " ".join(tokens[start: start + L])
                 if phrase in self.lexiconmap:
-                    match, match_len = self.lexiconmap[phrase], L
-                    break
+                    return self.lexiconmap[phrase], L
+            return None, 0
+        # ─────────────────────────────────────────────────────────────────────
+
+        while idx < n:
+            match, match_len = _find_match(flat, idx)
 
             if match is None:
                 idx += 1
                 continue
 
-            phrase_str = " ".join(flat[idx: idx + match_len])
+            phrase_str = " ".join(flat[idx: idx + match_len])  # used inside _accumulate
 
-            if debug:
-                ent0 = match[0]
-                hit_trace.append({
-                    "phrase":     phrase_str,
-                    "emotions":   ent0["emotions"],
-                    "polarities": ent0["polarities"],
-                    "appraisals": ent0["appraisals"],
-                    "score":      round(ent0["score"], 4),
-                })
+            # ── NegationCue branch (Fix B) ────────────────────────────────────
+            neg_ent = next((e for e in match if e["isnegation"]), None)
+            if neg_ent is not None:
+                # Record the cue itself in vn and in hit_trace
+                vn[0] = 1.0
 
+                # Per-cue scope/attenuation (from injected extra cues or RDF defaults)
+                cue_scope = neg_ent.get("negation_scope", 2)
+                cue_attn  = neg_ent.get("negation_attn",  self.negation_attenuation)
+
+                if debug:
+                    hit_trace.append({
+                        "phrase":     phrase_str,
+                        "emotions":   neg_ent["emotions"],
+                        "polarities": neg_ent["polarities"],
+                        "appraisals": neg_ent["appraisals"],
+                        "score":      round(neg_ent["score"], 4),
+                        "is_negation_cue": True,
+                    })
+
+                # Sub-scan the negation scope window (Fix B core)
+                j           = idx + match_len          # first token after the cue
+                negation_end = idx + match_len + cue_scope
+
+                while j < negation_end and j < n:
+                    phrase_str, inner_match, inner_len = None, None, 0
+                    for L in range(min(self.mwe_max_len, n - j), 0, -1):
+                        candidate = " ".join(flat[j: j + L])
+                        if candidate in self.lexiconmap:
+                            inner_match = self.lexiconmap[candidate]
+                            inner_len   = L
+                            phrase_str  = candidate
+                            break
+
+                    if inner_match is None:
+                        j += 1
+                        continue
+
+                    for ent in inner_match:
+                        if ent["isnegation"]:
+                            # Nested negation cue — double-negation handling:
+                            # reset the cue, update window, record it, and break
+                            vn[0]        = 1.0
+                            cue_scope    = ent.get("negation_scope", 2)
+                            cue_attn     = ent.get("negation_attn",  self.negation_attenuation)
+                            negation_end  = j + inner_len + cue_scope
+                            if debug:
+                                hit_trace.append({
+                                    "phrase":          phrase_str,
+                                    "emotions":        ent["emotions"],
+                                    "polarities":      ent["polarities"],
+                                    "appraisals":      ent["appraisals"],
+                                    "score":           round(ent["score"], 4),
+                                    "is_negation_cue": True,
+                                })
+                            break
+                        # Attenuate and register — Fix B: no longer silently skipped
+                        attenuated_sc = ent["score"] * cue_attn
+                        _accumulate(ent, attenuated_sc,
+                                    negated_by=phrase_str,
+                                    attn_factor=cue_attn)
+
+                    j += inner_len if inner_len > 0 else 1
+
+                idx = negation_end   # advance past the entire negation window
+                continue
+
+            # ── Normal (non-negation) match ───────────────────────────────────
             for ent in match:
-                if ent["isnegation"]:
-                    vn[0] = 1.0
-                    idx += match_len
-                    continue
-
-                sc = ent["score"]
-                if vn[0] > 0:
-                    sc *= self.negation_attenuation
-
-                for e, w in ent["emotions"].items():
-                    if e in self.ALLEMOTIONS:
-                        ve[self.ALLEMOTIONS.index(e)] += sc * w
-
-                # VSFC polarity injection: aggregate emotion scores into polarity dims
-                pos_sc = sum(w for e, w in ent["emotions"].items() if e in self.POS_EMOTIONS)
-                neg_sc = sum(w for e, w in ent["emotions"].items() if e in self.NEG_EMOTIONS)
-                neu_sc = ent["emotions"].get("Neutral", 0.0)
-                if pos_sc > 0: vp[0] += sc * pos_sc
-                if neg_sc > 0: vp[1] += sc * neg_sc
-                if neu_sc > 0: vp[2] += sc * neu_sc
-                for x in ent["polarities"]:
-                    if x in self.POLARITY_CLASSES:
-                        vp[self.POLARITY_CLASSES.index(x)] += sc
-
-                for x in ent["appraisals"]:
-                    if x in self.ALLAPPRAISALS:
-                        va[self.ALLAPPRAISALS.index(x)] += sc
-                for x in ent["intensities"]:
-                    if x in self.INTENSITY_CLASSES:
-                        vi[self.INTENSITY_CLASSES.index(x)] = 1.0
+                _accumulate(ent, ent["score"])
 
             idx += match_len
 
@@ -764,6 +889,9 @@ def render_xai(result, model_type):
 
     rows = []
     for h in hit_trace:
+        is_neg_cue = h.get("is_negation_cue", False)
+        is_negated = h.get("is_negated", False)
+
         dominant_emo = max(h["emotions"], key=h["emotions"].get) if h["emotions"] else "—"
         dominant_pol = h["polarities"][0] if h["polarities"] else "—"
         pol_map = {
@@ -772,14 +900,25 @@ def render_xai(result, model_type):
             "NeutralPolarity":  "➖ Neutral",
         }
         dominant_pol = pol_map.get(dominant_pol, dominant_pol)
+
         emo_str = ", ".join(
             f"{e} ({w:.2f})" for e, w in sorted(h["emotions"].items(), key=lambda x: -x[1])
         )
+
+        # Build the phrase label with XAI negation markers
+        phrase_label = h["phrase"]
+        if is_neg_cue:
+            phrase_label = f"⊘ {phrase_label}  [NegationCue]"
+        elif is_negated:
+            negator     = h.get("negated_by", "?")
+            attn        = h.get("attn_factor", 0.5)
+            phrase_label = f"⊖ {phrase_label}  (negated by '{negator}' ×{attn})"
+
         rows.append({
-            "Matched Phrase": h["phrase"],
+            "Matched Phrase": phrase_label,
             "Emotions":       emo_str,
             "Polarity":       dominant_pol,
-            "Confidence":     f"{h['score']:.3f}",
+            "Score (effective)": f"{h['score']:.3f}",
         })
 
     st.table(pd.DataFrame(rows))
@@ -837,7 +976,7 @@ def main():
         st.divider()
         st.caption("Hybrid Ontology-NLP Emotion Classifier")
 
-    st.title("Hybrid Ontology-NLP Emotion Classifier (Demo)")
+    st.title("Hybrid Ontology-NLP Emotion Classifier")
 
     # ── Load lightweight resources once (cached) ─────────────────────────────
     # PhoBERT model weights are loaded lazily via get_model() at inference time.
