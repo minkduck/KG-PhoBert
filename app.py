@@ -855,6 +855,14 @@ def render_xai(result, model_type):
 # 8. Streamlit UI
 # ==========================================
 def main():
+    # Friendly labels used in result subheaders (domain selector removed).
+    DOMAIN_DISPLAY = {
+        "Education (VSFC)":            "VSFC",
+        "Social (VSMEC)":              "VSMEC",
+        "Education – 7 label (Ekman)": "VSFC-Ekman",
+        "All domains":                 "All",
+    }
+
     # ── Sidebar — global controls ────────────────────────────────────────────
     with st.sidebar:
         st.header("Settings")
