@@ -404,7 +404,12 @@ class OntologyEngine:
                     inside a negation scope, but the entry is NEVER silently skipped.
         """
         raw_tokens = ViTokenizer.tokenize(str(text).lower()).split()
-        flat = [self._norm(t) for t in raw_tokens if self._norm(t)]
+        # Expand ViTokenizer MWE tokens (e.g. "chưa_chi_tiết" → ["chưa", "chi", "tiết"])
+        # so that single-word negation cues are never buried inside a compound token.
+        expanded_tokens = []
+        for t in raw_tokens:
+            expanded_tokens.extend(t.split("_"))
+        flat = [self._norm(t) for t in expanded_tokens if self._norm(t)]
         n = len(flat)
 
         ve = np.zeros(len(self.ALLEMOTIONS),       dtype=np.float32)
