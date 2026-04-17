@@ -267,7 +267,7 @@ class OntologyEngine:
         # 2. Cache direct emotion categories
         for s, _, o in self.g.triples((None, EK.hasEmotionCategory, None)):
             e = self.EMOTIONMAPPING.get(self._local(o))
-            if e in self.ALLEMOTIONS:
+            if e in self.ALLEMOTIONS or e == "NegationCue":
                 sim_cache[s] = [e]
 
         # 3. Type-based fallback
