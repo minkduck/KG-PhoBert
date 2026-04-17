@@ -203,6 +203,24 @@ class OntologyEngine:
         self.sim_matrix = self._build_similarity_matrix()
         self.lexiconmap = self._build_strict_lexicon()
 
+        # Safety-net: guarantee core Vietnamese negation cues are always in the lexicon
+        _FALLBACK_NEG_ENTRY = [{
+            "emotions": {"NegationCue": 1.0},
+            "score": self.defaultconf,
+            "confidence": self.defaultconf,
+            "appraisals": [],
+            "intensities": [],
+            "polarities": [],
+            "isnegation": True,
+            "negation_scope": 2,
+            "negation_attn": self.negation_attenuation,
+        }]
+        for _neg_word in ["không", "chưa", "chẳng", "chả", "chưa hề", "không hề", "chẳng hề"]:
+            if _neg_word not in self.lexiconmap:
+                self.lexiconmap[_neg_word] = _FALLBACK_NEG_ENTRY
+                if self.verbose:
+                    print(f"  [NegFallback] inserted safety-net entry for '{_neg_word}'")
+
         self.mwe_max_len = 1
         for k in self.lexiconmap:
             self.mwe_max_len = max(self.mwe_max_len, len(k.split()))
@@ -301,10 +319,7 @@ class OntologyEngine:
             if r.dom and self._local(r.dom) not in self.VALID_DOMAINS:
                 continue
             w = self._norm(r.word)
-            if len(w) < 2 or w in self.AMBIGUOUS_TERMS:
-                continue
-
-            # Resolve emotions
+            # Resolve emotion category first so we can check isnegation BEFORE filtering
             emos = {}
             if r.stim in mix_cache:
                 raw = mix_cache[r.stim]
@@ -314,6 +329,12 @@ class OntologyEngine:
             elif r.stim in sim_cache:
                 lst = sim_cache[r.stim]
                 emos = {k: 1.0 for k in lst}
+            
+            is_neg_cue = "NegationCue" in emos
+            # Allow short/ambiguous tokens through if they are NegationCues
+            if (len(w) < 2 or w in self.AMBIGUOUS_TERMS) and not is_neg_cue:
+                continue
+
             if not emos:
                 continue
 
