@@ -171,7 +171,7 @@ class OntologyEngine:
     }
 
     AMBIGUOUS_TERMS = {
-        "hay", "chả", "cơ", "ngờ", "ý", "quá", "lại",
+        "hay", "cơ", "ngờ", "ý", "quá", "lại",
         "tôi", "tao", "tớ", "mình", "bạn", "nó", "hắn", "anh", "chị", "em",
         "là", "thì", "mà", "bị", "được", "cái", "con", "người",
     }
@@ -204,20 +204,21 @@ class OntologyEngine:
         self.lexiconmap = self._build_strict_lexicon()
 
         # Safety-net: guarantee core Vietnamese negation cues are always in the lexicon
-        _FALLBACK_NEG_ENTRY = [{
-            "emotions": {"NegationCue": 1.0},
-            "score": self.defaultconf,
-            "confidence": self.defaultconf,
-            "appraisals": [],
-            "intensities": [],
-            "polarities": [],
-            "isnegation": True,
-            "negation_scope": 2,
-            "negation_attn": self.negation_attenuation,
-        }]
-        for _neg_word in ["không", "chưa", "chẳng", "chả", "chưa hề", "không hề", "chẳng hề"]:
+        _NEG_WORDS = ["không", "chưa", "chẳng", "chả", "chưa hề", "không hề", "chẳng hề"]
+        for _neg_word in _NEG_WORDS:
             if _neg_word not in self.lexiconmap:
-                self.lexiconmap[_neg_word] = _FALLBACK_NEG_ENTRY
+                # Create a FRESH dict per key &emdash; never share a mutable reference
+                self.lexiconmap[_neg_word] = [{
+                    "emotions": {"NegationCue": 1.0},
+                    "score": self.defaultconf,
+                    "confidence": self.defaultconf,
+                    "appraisals": [],
+                    "intensities": [],
+                    "polarities": [],
+                    "isnegation": True,
+                    "negation_scope": 2,
+                    "negation_attn": self.negation_attenuation,
+                }]
                 if self.verbose:
                     print(f"  [NegFallback] inserted safety-net entry for '{_neg_word}'")
 
