@@ -203,24 +203,68 @@ class OntologyEngine:
         self.sim_matrix = self._build_similarity_matrix()
         self.lexiconmap = self._build_strict_lexicon()
 
-        # Safety-net: guarantee core Vietnamese negation cues are always in the lexicon
-        _NEG_WORDS = ["không", "chưa", "chẳng", "chả", "chưa hề", "không hề", "chẳng hề"]
+        # ── Negation safety-net ────────────────────────────────────────────────────
+        # _NEG_WORDS  : canonical forms guaranteed in lexiconmap (KG entry reused if
+        #               present; fresh fallback synthesised otherwise).
+        # _NEG_ALIASES: informal / teen-text / no-diacritic tokens mapped to their
+        #               canonical so the KG entry is reused — no duplication.
+        _NEG_WORDS = [
+            # fully-diacriticised standard forms
+            "không", "chưa", "chẳng", "chả",
+            "chưa hề", "không hề", "chẳng hề",
+            # no-diacritic canonical forms (also needed as lookup keys)
+            "chua", "chang", "cha",
+            "chua he", "khong he", "chang he",
+        ]
+        _NEG_ALIASES: dict[str, str] = {
+            # ── "không" family ──────────────────────────────────────
+            "k":    "không",   # most common teen abbreviation
+            "ko":   "không",
+            "k0":   "không",
+            "khg":  "không",
+            "kh":   "không",
+            "hong": "không",   # southern pronunciation spelling
+            "hok":  "không",
+            "hem":  "không",   # southern "hổng/hem"
+            "hum":  "không",
+            "khong":"không",   # no-diacritic typed form
+            # ── "chưa" family ───────────────────────────────────────
+            "chx":  "chưa",
+            # ── "chẳng" family ──────────────────────────────────────
+            "chan": "chẳng",
+            # ── "chả" / mild negation ───────────────────────────────
+            "chao": "chả",
+        }
+
+        def _make_neg_entry() -> list[dict]:
+            """Return a fresh NegationCue entry list (never share mutable refs)."""
+            return [{
+                "emotions":        {"NegationCue": 1.0},
+                "score":           self.defaultconf,
+                "confidence":      self.defaultconf,
+                "appraisals":      [],
+                "intensities":     [],
+                "polarities":      [],
+                "isnegation":      True,
+                "negation_scope":  2,
+                "negation_attn":   self.negation_attenuation,
+            }]
+
+        # 1. Guarantee every canonical form exists in the lexicon
         for _neg_word in _NEG_WORDS:
             if _neg_word not in self.lexiconmap:
-                # Create a FRESH dict per key &emdash; never share a mutable reference
-                self.lexiconmap[_neg_word] = [{
-                    "emotions": {"NegationCue": 1.0},
-                    "score": self.defaultconf,
-                    "confidence": self.defaultconf,
-                    "appraisals": [],
-                    "intensities": [],
-                    "polarities": [],
-                    "isnegation": True,
-                    "negation_scope": 2,
-                    "negation_attn": self.negation_attenuation,
-                }]
+                self.lexiconmap[_neg_word] = _make_neg_entry()
                 if self.verbose:
                     print(f"  [NegFallback] inserted safety-net entry for '{_neg_word}'")
+
+        # 2. Point every alias at its canonical's entry (or a fresh entry if missing)
+        for _alias, _canonical in _NEG_ALIASES.items():
+            if _alias not in self.lexiconmap:
+                self.lexiconmap[_alias] = self.lexiconmap.get(
+                    _canonical, _make_neg_entry()
+                )
+                if self.verbose:
+                    print(f"  [NegAlias] '{_alias}' → '{_canonical}'")
 
         self.mwe_max_len = 1
         for k in self.lexiconmap:
